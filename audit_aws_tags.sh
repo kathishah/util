@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Read-only AWS tag audit.
+# AWS tag audit (read-only by default; optional interactive tagging).
 #
 # This script scans commonly-used AWS resources and prints resources that are
-# missing required cost-allocation tags. It does not create, update, or delete
-# AWS resources or tags.
+# missing required cost-allocation tags. Use -t/--tag to interactively apply
+# Application and Environment tags to missing resources. Add -n/--dry-run with
+# -t to walk through the same prompts without making AWS changes.
 #
 # Defaults:
 #   Region        : us-west-2, or $AWS_REGION if set
@@ -17,6 +18,8 @@
 #   ./audit_aws_tags.sh -s ec2-instance,rds-instance,s3,lambda,apprunner
 #   ./audit_aws_tags.sh -a
 #   ./audit_aws_tags.sh -j 8
+#   ./audit_aws_tags.sh -t
+#   ./audit_aws_tags.sh -t -n
 #
 set -u
 set -o pipefail
@@ -28,8 +31,19 @@ OUTPUT="table"
 SERVICES_ARG=""
 SHOW_TAGGED=false
 QUIET=false
+INTERACTIVE_TAG=false
+DRY_RUN=false
 PARALLEL_JOBS="${AWS_AUDIT_JOBS:-6}"
 REQUIRED_TAGS=("Application" "Environment")
+RECORD_FIELD_SEP=$'\x1e'
+MISSING_RESOURCES_FILE=""
+TAG_VALUES_APPS_FILE=""
+TAG_VALUES_ENVS_FILE=""
+TAG_JOB_PIDS=()
+TAGGED_SERVICES=()
+TAGGED_NAMES=()
+TAGGED_APPS=()
+TAGGED_ENVS=()
 TOTAL_SCANNED=0
 TOTAL_MISSING=0
 TOTAL_ERRORS=0
@@ -38,7 +52,7 @@ usage() {
   cat <<'EOF'
 Usage: ./audit_aws_tags.sh [flags]
 
-Read-only AWS tag audit for common cost-bearing resources.
+AWS tag audit for common cost-bearing resources (read-only unless -t/--tag).
 
 By default, this scans every supported service in us-west-2 plus global
 services such as S3, CloudFront, and Route53.
@@ -51,6 +65,8 @@ Flags:
   -a, --include-tagged         Include correctly tagged resources in output
   -j, --jobs N                 Number of services to scan in parallel (default: 6)
   -q, --quiet                  Hide scan progress
+  -t, --tag                    Interactively fix missing or malformed required tags
+  -n, --dry-run                With -t, run the interactive flow without applying tags
   -h, --help                   Show help
 
 Service labels:
@@ -94,6 +110,14 @@ while [[ $# -gt 0 ]]; do
       QUIET=true
       shift
       ;;
+    -t|--tag)
+      INTERACTIVE_TAG=true
+      shift
+      ;;
+    -n|--dry-run)
+      DRY_RUN=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -113,6 +137,11 @@ fi
 
 if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [[ "$PARALLEL_JOBS" -lt 1 ]]; then
   echo "-j/--jobs must be a positive integer" >&2
+  exit 1
+fi
+
+if $DRY_RUN && ! $INTERACTIVE_TAG; then
+  echo "-n/--dry-run requires -t/--tag" >&2
   exit 1
 fi
 
@@ -136,7 +165,45 @@ clean_value() {
 is_missing_value() {
   local value
   value=$(clean_value "${1:-}")
-  [[ -z "$value" || "$value" == "None" || "$value" == "none" || "$value" == "null" || "$value" == "NULL" || "$value" == "[]" ]]
+  [[ -z "$value" || "$value" == "None" || "$value" == "none" || "$value" == "null" || "$value" == "NULL" || "$value" == "[]" || "$value" == "M" ]]
+}
+
+is_malformed_tag_value() {
+  local value
+  value=$(clean_value "${1:-}")
+  is_missing_value "$value" && return 1
+  [[ "$value" == \[malformed\]* ]] && return 0
+
+  # Pasted audit rows, ARNs, and resource IDs are not valid app/env labels.
+  [[ "$value" == *[[:space:]]* ]] && return 0
+  ((${#value} > 64)) && return 0
+  [[ "$value" == *,* ]] && return 0
+  [[ "$value" == *arn:aws:* ]] && return 0
+  [[ "$value" =~ vol-[0-9a-f]+ ]] && return 0
+  [[ "$value" =~ i-[0-9a-f]{8,} ]] && return 0
+  [[ "$value" =~ sg-[0-9a-f]{8,} ]] && return 0
+  [[ "$value" =~ eipalloc-[0-9a-f]+ ]] && return 0
+  [[ "$value" =~ Z[0-9A-Z]{10,} ]] && return 0
+  [[ "$value" =~ ^(s3|cloudfront|route53|ec2-instance|ebs-volume|ebs-snapshot|eip|nat-gateway|security-group|elbv2|elb|rds-instance|rds-cluster|ecr|lambda|secretsmanager|logs|cloudwatch-alarm|dynamodb|sqs|sns|ses-identity|ses-configuration-set|ecs-cluster|ecs-service|efs|apprunner)[[:space:]] ]] && return 0
+  return 1
+}
+
+format_malformed_display() {
+  local value="$1"
+  value=$(clean_value "$value")
+  value=$(table_cell "$value" 96)
+  printf '[malformed] %s' "$value"
+}
+
+classify_required_tag_value() {
+  local value="$1"
+  if is_missing_value "$value"; then
+    printf 'missing'
+  elif is_malformed_tag_value "$value"; then
+    printf 'malformed'
+  else
+    printf 'ok'
+  fi
 }
 
 join_by() {
@@ -192,21 +259,39 @@ aws_query_rows() {
   printf '%s' "$out"
 }
 
+aws_query_list() {
+  local query="$1"
+  shift
+  local out
+  out=$(aws "$@" --query "$query" --output text 2>/dev/null) || out=""
+  out="${out//$'\r'/}"
+  # Text output may separate array elements with tabs or newlines; never join with spaces.
+  printf '%s' "$out" | tr '\t' '\n'
+}
+
 required_tags_check() {
   local query_template="$1"
   shift
   local missing=()
   local display=()
-  local key query value
+  local key query value status
   for key in "${REQUIRED_TAGS[@]}"; do
     query="${query_template//__TAG_KEY__/$key}"
     value=$(aws_query_text "$query" "$@")
-    if is_missing_value "$value"; then
-      missing+=("$key")
-      display+=("M")
-    else
-      display+=("$value")
-    fi
+    status=$(classify_required_tag_value "$value")
+    case "$status" in
+      missing)
+        missing+=("$key")
+        display+=("M")
+        ;;
+      malformed)
+        missing+=("$key")
+        display+=("$(format_malformed_display "$value")")
+        ;;
+      *)
+        display+=("$value")
+        ;;
+    esac
   done
   TAGS_COLUMN=$(join_by "," "${display[@]}")
   if [[ ${#missing[@]} -eq 0 ]]; then
@@ -220,15 +305,23 @@ required_ec2_tags_check() {
   local region="$1" resource_id="$2"
   local missing=()
   local display=()
-  local key value
+  local key value status
   for key in "${REQUIRED_TAGS[@]}"; do
     value=$(aws_query_text "Tags[0].Value" ec2 describe-tags --region "$region" --filters "Name=resource-id,Values=$resource_id" "Name=key,Values=$key")
-    if is_missing_value "$value"; then
-      missing+=("$key")
-      display+=("M")
-    else
-      display+=("$value")
-    fi
+    status=$(classify_required_tag_value "$value")
+    case "$status" in
+      missing)
+        missing+=("$key")
+        display+=("M")
+        ;;
+      malformed)
+        missing+=("$key")
+        display+=("$(format_malformed_display "$value")")
+        ;;
+      *)
+        display+=("$value")
+        ;;
+    esac
   done
   TAGS_COLUMN=$(join_by "," "${display[@]}")
   if [[ ${#missing[@]} -eq 0 ]]; then
@@ -246,12 +339,21 @@ emit_resource() {
   if [[ -n "$missing" ]]; then
     missing_resource=true
     TOTAL_MISSING=$((TOTAL_MISSING + 1))
-  elif ! $SHOW_TAGGED; then
+  fi
+
+  tags_display="${TAGS_COLUMN:-}"
+  if $INTERACTIVE_TAG; then
+    [[ -n "$tags_display" ]] && record_tag_values "$tags_display"
+    if $missing_resource; then
+      record_missing_resource "$region" "$service" "$name" "$resource_id" "$missing" "${tags_display:--}"
+    fi
+  fi
+
+  if [[ -z "$missing" ]] && ! $SHOW_TAGGED; then
     TAGS_COLUMN=""
     return
   fi
 
-  tags_display="${TAGS_COLUMN:-}"
   [[ -z "$tags_display" ]] && tags_display="-"
   TAGS_COLUMN=""
 
@@ -279,6 +381,454 @@ table_cell() {
     printf '%s...' "${value:0:$((width - 3))}"
   else
     printf '%s' "$value"
+  fi
+}
+
+record_tag_values() {
+  local tags_display="$1" app_val env_val
+  [[ -z "$TAG_VALUES_APPS_FILE" || -z "$TAG_VALUES_ENVS_FILE" ]] && return 0
+  IFS=',' read -r app_val env_val <<< "$tags_display"
+  if [[ "$app_val" != "M" && "$app_val" != \[malformed\]* ]] && ! is_missing_value "$app_val" && ! is_malformed_tag_value "$app_val"; then
+    printf '%s\n' "$app_val" >> "$TAG_VALUES_APPS_FILE"
+  fi
+  if [[ "$env_val" != "M" && "$env_val" != \[malformed\]* ]] && ! is_missing_value "$env_val" && ! is_malformed_tag_value "$env_val"; then
+    printf '%s\n' "$env_val" >> "$TAG_VALUES_ENVS_FILE"
+  fi
+}
+
+record_missing_resource() {
+  local region="$1" service="$2" name="$3" resource_id="$4" missing="$5" tags_display="$6"
+  [[ -z "$MISSING_RESOURCES_FILE" ]] && return 0
+  printf '%s\n' \
+    "${region}${RECORD_FIELD_SEP}${service}${RECORD_FIELD_SEP}${name}${RECORD_FIELD_SEP}${resource_id}${RECORD_FIELD_SEP}${missing}${RECORD_FIELD_SEP}${tags_display}" \
+    >> "$MISSING_RESOURCES_FILE"
+}
+
+build_key_value_tags() {
+  local missing="$1" app="$2" env="$3"
+  local tags=()
+  [[ -n "$app" ]] && tags+=("Key=Application,Value=$app")
+  [[ -n "$env" ]] && tags+=("Key=Environment,Value=$env")
+  ((${#tags[@]})) && printf '%s\n' "${tags[@]}"
+}
+
+build_map_tags() {
+  local missing="$1" app="$2" env="$3"
+  local tags=()
+  [[ -n "$app" ]] && tags+=("Application=$app")
+  [[ -n "$env" ]] && tags+=("Environment=$env")
+  ((${#tags[@]})) && printf '%s\n' "${tags[@]}"
+}
+
+build_ecs_tags() {
+  local missing="$1" app="$2" env="$3"
+  local tags=()
+  [[ -n "$app" ]] && tags+=("key=Application,value=$app")
+  [[ -n "$env" ]] && tags+=("key=Environment,value=$env")
+  ((${#tags[@]})) && printf '%s\n' "${tags[@]}"
+}
+
+build_cloudfront_tags() {
+  local missing="$1" app="$2" env="$3"
+  local items=()
+  [[ -n "$app" ]] && items+=("{Key=Application,Value=$app}")
+  [[ -n "$env" ]] && items+=("{Key=Environment,Value=$env}")
+  ((${#items[@]})) && printf 'Items=[%s]' "$(join_by , "${items[@]}")"
+}
+
+describe_tags_to_apply() {
+  local missing="$1" app="$2" env="$3"
+  local parts=()
+  [[ -n "$app" ]] && parts+=("Application=$app")
+  [[ -n "$env" ]] && parts+=("Environment=$env")
+  ((${#parts[@]})) && join_by ", " "${parts[@]}"
+}
+
+aws_quiet() {
+  aws "$@" >/dev/null || return 1
+}
+
+apply_route53_tags() {
+  local resource_id="$1" missing="$2" app="$3" env="$4"
+  local tags=() tag args=(route53 change-tags-for-resource --resource-type hostedzone --resource-id "$resource_id")
+
+  read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+  ((${#tags[@]})) || return 0
+  for tag in "${tags[@]}"; do
+    args+=(--add-tags "$tag")
+  done
+  aws_quiet "${args[@]}"
+}
+
+apply_s3_tags() {
+  local bucket="$1" missing="$2" app="$3" env="$4"
+  local raw key value items=()
+
+  raw=$(aws_query_rows "TagSet[].[Key,Value]" s3api get-bucket-tagging --bucket "$bucket" 2>/dev/null) || raw=""
+  while IFS=$'\t' read -r key value; do
+    [[ -z "$key" || "$key" == "None" ]] && continue
+    [[ "$key" == "Application" && -n "$app" ]] && continue
+    [[ "$key" == "Environment" && -n "$env" ]] && continue
+    items+=("{Key=${key},Value=${value}}")
+  done <<< "$raw"
+
+  [[ -n "$app" ]] && items+=("{Key=Application,Value=$app}")
+  [[ -n "$env" ]] && items+=("{Key=Environment,Value=$env}")
+
+  aws_quiet s3api put-bucket-tagging --bucket "$bucket" --tagging "TagSet=[$(join_by , "${items[@]}")]"
+}
+
+read_lines_into() {
+  local array_name="$1"
+  local line
+  eval "${array_name}=()"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && eval "${array_name}+=(\"\$line\")"
+  done
+}
+
+apply_resource_tags() {
+  local region="$1" service="$2" resource_id="$3" missing="$4" app="$5" env="$6"
+  local tags=() map_tags=() ecs_tags=() arn cf_tags summary
+
+  if $DRY_RUN; then
+    summary=$(describe_tags_to_apply "$missing" "$app" "$env")
+    [[ -z "$summary" ]] && return 0
+    log "[dry-run] Would tag ${service} ${resource_id} (${region}): ${summary}"
+    return 0
+  fi
+
+  case "$service" in
+    ec2-instance|ebs-volume|ebs-snapshot|eip|nat-gateway|security-group)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet ec2 create-tags --region "$region" --resources "$resource_id" --tags "${tags[@]}"
+      ;;
+    s3)
+      apply_s3_tags "$resource_id" "$missing" "$app" "$env"
+      ;;
+    cloudfront)
+      cf_tags=$(build_cloudfront_tags "$missing" "$app" "$env")
+      [[ -z "$cf_tags" ]] && return 0
+      arn="arn:aws:cloudfront::${ACCOUNT_ID}:distribution/${resource_id}"
+      aws_quiet cloudfront tag-resource --resource "$arn" --tags "$cf_tags"
+      ;;
+    route53)
+      apply_route53_tags "$resource_id" "$missing" "$app" "$env"
+      ;;
+    elbv2)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet elbv2 add-tags --region "$region" --resource-arns "$resource_id" --tags "${tags[@]}"
+      ;;
+    elb)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet elb add-tags --region "$region" --load-balancer-names "$resource_id" --tags "${tags[@]}"
+      ;;
+    rds-instance|rds-cluster)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet rds add-tags-to-resource --region "$region" --resource-name "$resource_id" --tags "${tags[@]}"
+      ;;
+    ecr)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet ecr tag-resource --region "$region" --resource-arn "$resource_id" --tags "${tags[@]}"
+      ;;
+    lambda)
+      read_lines_into map_tags < <(build_map_tags "$missing" "$app" "$env")
+      ((${#map_tags[@]})) || return 0
+      aws_quiet lambda tag-resource --region "$region" --resource "$resource_id" --tags "$(join_by , "${map_tags[@]}")"
+      ;;
+    secretsmanager)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet secretsmanager tag-resource --region "$region" --secret-id "$resource_id" --tags "${tags[@]}"
+      ;;
+    logs)
+      read_lines_into map_tags < <(build_map_tags "$missing" "$app" "$env")
+      ((${#map_tags[@]})) || return 0
+      aws_quiet logs tag-log-group --region "$region" --log-group-name "$resource_id" --tags "$(join_by , "${map_tags[@]}")"
+      ;;
+    cloudwatch-alarm)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet cloudwatch tag-resource --region "$region" --resource-arn "$resource_id" --tags "${tags[@]}"
+      ;;
+    dynamodb)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet dynamodb tag-resource --region "$region" --resource-arn "$resource_id" --tags "${tags[@]}"
+      ;;
+    sqs)
+      read_lines_into map_tags < <(build_map_tags "$missing" "$app" "$env")
+      ((${#map_tags[@]})) || return 0
+      aws_quiet sqs tag-queue --region "$region" --queue-url "$resource_id" --tags "$(join_by , "${map_tags[@]}")"
+      ;;
+    sns)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet sns tag-resource --region "$region" --resource-arn "$resource_id" --tags "${tags[@]}"
+      ;;
+    ses-identity|ses-configuration-set)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet sesv2 tag-resource --region "$region" --resource-arn "$resource_id" --tags "${tags[@]}"
+      ;;
+    ecs-cluster|ecs-service)
+      read_lines_into ecs_tags < <(build_ecs_tags "$missing" "$app" "$env")
+      ((${#ecs_tags[@]})) || return 0
+      aws_quiet ecs tag-resource --region "$region" --resource-arn "$resource_id" --tags "${ecs_tags[@]}"
+      ;;
+    apprunner)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet apprunner tag-resource --region "$region" --resource-arn "$resource_id" --tags "${tags[@]}"
+      ;;
+    efs)
+      read_lines_into tags < <(build_key_value_tags "$missing" "$app" "$env")
+      ((${#tags[@]})) || return 0
+      aws_quiet efs tag-resource --region "$region" --resource-id "$resource_id" --tags "${tags[@]}"
+      ;;
+    *)
+      echo "Unsupported service for tagging: $service" >&2
+      return 1
+      ;;
+  esac
+}
+
+load_unique_values() {
+  local file="$1"
+  local dest_name="$2"
+  local line
+  eval "${dest_name}=()"
+  [[ ! -s "$file" ]] && return 0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && eval "${dest_name}+=(\"\$line\")"
+  done < <(sort -u "$file")
+}
+
+reply_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+merge_interactive_scan_files() {
+  MERGED_MISSING_FILE="$RUN_TMP_DIR/missing.tsv"
+  MERGED_APPS_FILE="$RUN_TMP_DIR/apps.txt"
+  MERGED_ENVS_FILE="$RUN_TMP_DIR/envs.txt"
+  : > "$MERGED_MISSING_FILE"
+  : > "$MERGED_APPS_FILE"
+  : > "$MERGED_ENVS_FILE"
+
+  local i
+  for ((i=0; i<JOB_COUNT; i++)); do
+    [[ -s "$RUN_TMP_DIR/${i}.${JOB_LABELS[$i]}.missing" ]] && \
+      cat "$RUN_TMP_DIR/${i}.${JOB_LABELS[$i]}.missing" >> "$MERGED_MISSING_FILE"
+    [[ -s "$RUN_TMP_DIR/${i}.${JOB_LABELS[$i]}.apps" ]] && \
+      cat "$RUN_TMP_DIR/${i}.${JOB_LABELS[$i]}.apps" >> "$MERGED_APPS_FILE"
+    [[ -s "$RUN_TMP_DIR/${i}.${JOB_LABELS[$i]}.envs" ]] && \
+      cat "$RUN_TMP_DIR/${i}.${JOB_LABELS[$i]}.envs" >> "$MERGED_ENVS_FILE"
+  done
+}
+
+wait_tag_jobs() {
+  local pid
+  # Bash 3.2 + set -u treats "${array[@]}" on an empty array as unbound.
+  if ((${#TAG_JOB_PIDS[@]} > 0)); then
+    for pid in "${TAG_JOB_PIDS[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+  fi
+  TAG_JOB_PIDS=()
+}
+
+append_tag_error_log() {
+  local service="$1" name="$2" err_file="$3"
+  local line
+  [[ ! -s "$err_file" ]] && return 0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    printf '[%s %s] %s\n' "$service" "$name" "$line" >> "${TAG_FAILURES_FILE}.log"
+  done < "$err_file"
+}
+
+queue_resource_tags() {
+  local region="$1" service="$2" name="$3" resource_id="$4" missing="$5" app="$6" env="$7"
+  local err_file
+  if $DRY_RUN; then
+    apply_resource_tags "$region" "$service" "$resource_id" "$missing" "$app" "$env"
+    return 0
+  fi
+  err_file="${TAG_ERR_DIR}/job.${#TAG_JOB_PIDS[@]}.err"
+  (
+    if ! apply_resource_tags "$region" "$service" "$resource_id" "$missing" "$app" "$env" 2>"$err_file"; then
+      printf '%s\n' "${service}${RECORD_FIELD_SEP}${name}${RECORD_FIELD_SEP}${resource_id}" >> "$TAG_FAILURES_FILE"
+      append_tag_error_log "$service" "$name" "$err_file"
+    fi
+  ) &
+  TAG_JOB_PIDS+=("$!")
+}
+
+print_tag_session_summary() {
+  local total="$1" tagged="$2" skipped="$3"
+  local untagged="$4" i failed=0
+  local display_service display_name line fail_service fail_name fail_id
+
+  if [[ -s "$TAG_FAILURES_FILE" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && failed=$((failed + 1))
+    done < "$TAG_FAILURES_FILE"
+  fi
+
+  echo "" >&2
+  echo "Tagging summary:" >&2
+  echo "  Untagged resources: ${untagged}" >&2
+  echo "  Tagged resources: ${tagged}" >&2
+  if [[ "$failed" -gt 0 ]]; then
+    echo "  Failed resources: ${failed}" >&2
+  fi
+  if [[ "$skipped" -gt 0 ]]; then
+    echo "  Skipped resources: ${skipped}" >&2
+  fi
+  if [[ "$tagged" -eq 0 ]]; then
+    if [[ "$failed" -gt 0 && -s "${TAG_FAILURES_FILE}.log" ]]; then
+      echo "" >&2
+      echo "Errors:" >&2
+      cat "${TAG_FAILURES_FILE}.log" >&2
+    fi
+    return 0
+  fi
+
+  echo "" >&2
+  printf '%-18s %-48s %-24s %s\n' "SERVICE" "RESOURCE_NAME" "APP" "ENV" >&2
+  printf '%-18s %-48s %-24s %s\n' "------------------" "------------------------------------------------" "------------------------" "----------------" >&2
+  for ((i=0; i<tagged; i++)); do
+    display_service=$(table_cell "${TAGGED_SERVICES[$i]}" 18)
+    display_name=$(table_cell "${TAGGED_NAMES[$i]}" 48)
+    printf '%-18s %-48s %-24s %s\n' \
+      "$display_service" "$display_name" "${TAGGED_APPS[$i]}" "${TAGGED_ENVS[$i]}" >&2
+  done
+
+  if [[ "$failed" -gt 0 ]]; then
+    echo "" >&2
+    echo "Failed:" >&2
+    while IFS= read -r line; do
+      IFS="$RECORD_FIELD_SEP" read -r fail_service fail_name fail_id <<< "$line"
+      [[ -z "$fail_service" ]] && continue
+      printf '  %s %s (%s)\n' "$fail_service" "$fail_name" "$fail_id" >&2
+    done < "$TAG_FAILURES_FILE"
+    if [[ -s "${TAG_FAILURES_FILE}.log" ]]; then
+      echo "" >&2
+      echo "Errors:" >&2
+      cat "${TAG_FAILURES_FILE}.log" >&2
+    fi
+  fi
+}
+
+interactive_tag_resources() {
+  local missing_lines=() known_apps=() known_envs=()
+  local reply reply_l app env region service name resource_id missing tags_display
+  local total tagged=0 skipped=0 i
+  local apps_list envs_list
+
+  TAG_JOB_PIDS=()
+  TAGGED_SERVICES=()
+  TAGGED_NAMES=()
+  TAGGED_APPS=()
+  TAGGED_ENVS=()
+  TAG_FAILURES_FILE="$RUN_TMP_DIR/tag-failures.tsv"
+  TAG_ERR_DIR="$RUN_TMP_DIR/tag-errors"
+  mkdir -p "$TAG_ERR_DIR"
+  : > "$TAG_FAILURES_FILE"
+  : > "${TAG_FAILURES_FILE}.log"
+
+  merge_interactive_scan_files
+  read_lines_into missing_lines < "$MERGED_MISSING_FILE"
+  load_unique_values "$MERGED_APPS_FILE" known_apps
+  load_unique_values "$MERGED_ENVS_FILE" known_envs
+  total="${#missing_lines[@]}"
+
+  if [[ "$total" -eq 0 ]]; then
+    log "No resources with missing or malformed required tags."
+    return 0
+  fi
+
+  apps_list=$(
+    if ((${#known_apps[@]})); then join_by ", " "${known_apps[@]}"; else echo "(none found)"; fi
+  )
+  envs_list=$(
+    if ((${#known_envs[@]})); then join_by ", " "${known_envs[@]}"; else echo "(none found)"; fi
+  )
+
+  echo "" >&2
+  if $DRY_RUN; then
+    echo "Interactive tagging (dry-run): ${total} resource(s) with missing or malformed tags." >&2
+  else
+    echo "Interactive tagging: ${total} resource(s) with missing or malformed tags." >&2
+  fi
+  echo "Enter app,env for each resource, or s to skip, q to quit." >&2
+
+  for ((i=0; i<total; i++)); do
+    IFS="$RECORD_FIELD_SEP" read -r region service name resource_id missing tags_display <<< "${missing_lines[$i]}"
+    echo "" >&2
+    echo "[$((i + 1))/${total}] ${service} ${name}" >&2
+    [[ "$tags_display" != "-" ]] && echo "  Current tags: ${tags_display}" >&2
+    echo "  Applications: ${apps_list}" >&2
+    echo "  Environments: ${envs_list}" >&2
+
+    while true; do
+      read -r -p "app,env (s=skip q=quit): " reply
+      reply=$(clean_value "$reply")
+      reply_l=$(reply_lower "$reply")
+      case "$reply_l" in
+        q|quit)
+          break 2
+          ;;
+        s|skip)
+          skipped=$((skipped + 1))
+          break
+          ;;
+        *)
+          if [[ "$reply" == *,* ]]; then
+            IFS=',' read -r app env <<< "$reply"
+            app=$(clean_value "$app")
+            env=$(clean_value "$env")
+            if [[ -n "$app" && -n "$env" ]]; then
+              if is_malformed_tag_value "$app" || is_malformed_tag_value "$env"; then
+                echo "Invalid app or env (too long, whitespace, or looks like pasted audit output). Try again." >&2
+                continue
+              fi
+              TAGGED_SERVICES+=("$service")
+              TAGGED_NAMES+=("$name")
+              TAGGED_APPS+=("$app")
+              TAGGED_ENVS+=("$env")
+              queue_resource_tags "$region" "$service" "$name" "$resource_id" "$missing" "$app" "$env"
+              tagged=$((tagged + 1))
+              break
+            fi
+          fi
+          echo "Enter app,env or s or q." >&2
+          ;;
+      esac
+    done
+  done
+
+  wait_tag_jobs
+  print_tag_session_summary "$total" "$tagged" "$skipped" "$((total - tagged - skipped))"
+  if ! $DRY_RUN && [[ "$tagged" -gt 0 ]]; then
+    local applied=$((tagged))
+    if [[ -s "$TAG_FAILURES_FILE" ]]; then
+      local fail_line fail_count=0
+      while IFS= read -r fail_line; do
+        [[ -n "$fail_line" ]] && fail_count=$((fail_count + 1))
+      done < "$TAG_FAILURES_FILE"
+      applied=$((tagged - fail_count))
+    fi
+    if [[ "$applied" -gt 0 ]]; then
+      TOTAL_MISSING=$((TOTAL_MISSING - applied))
+      (( TOTAL_MISSING < 0 )) && TOTAL_MISSING=0
+    fi
   fi
 }
 
@@ -520,14 +1070,12 @@ scan_logs() {
   local region="$1"
   want_service logs || return
   log "Scanning $region: logs"
-  local names name missing
-  names=$(aws_query_text "logGroups[].logGroupName" logs describe-log-groups --region "$region")
-  [[ -z "$names" || "$names" == "None" ]] && return
+  local name missing
   while IFS= read -r name; do
     [[ -z "$name" || "$name" == "None" ]] && continue
     required_tags_check "tags.\"__TAG_KEY__\"" logs list-tags-log-group --region "$region" --log-group-name "$name"; missing="$REQUIRED_MISSING"
     emit_resource "$region" "logs" "$name" "$name" "$missing"
-  done <<< "$(printf '%s' "$names" | tr '\t' '\n')"
+  done <<< "$(aws_query_list "logGroups[].logGroupName" logs describe-log-groups --region "$region")"
 }
 
 scan_cloudwatch_alarms() {
@@ -596,7 +1144,7 @@ scan_ses() {
     if [[ -n "$identities" && "$identities" != "None" ]]; then
       for identity in $identities; do
         arn="arn:aws:ses:${region}:${ACCOUNT_ID}:identity/${identity}"
-        required_tags_check "Tags[?Key=='__TAG_KEY__'].Value|[0]" ses list-tags-for-resource --region "$region" --resource-arn "$arn"; missing="$REQUIRED_MISSING"
+        required_tags_check "Tags[?Key=='__TAG_KEY__'].Value|[0]" sesv2 list-tags-for-resource --region "$region" --resource-arn "$arn"; missing="$REQUIRED_MISSING"
         emit_resource "$region" "ses-identity" "$identity" "$arn" "$missing"
       done
     fi
@@ -609,7 +1157,7 @@ scan_ses() {
   [[ -z "$sets" || "$sets" == "None" ]] && return
   for set in $sets; do
     arn="arn:aws:ses:${region}:${ACCOUNT_ID}:configuration-set/${set}"
-    required_tags_check "Tags[?Key=='__TAG_KEY__'].Value|[0]" ses list-tags-for-resource --region "$region" --resource-arn "$arn"; missing="$REQUIRED_MISSING"
+    required_tags_check "Tags[?Key=='__TAG_KEY__'].Value|[0]" sesv2 list-tags-for-resource --region "$region" --resource-arn "$arn"; missing="$REQUIRED_MISSING"
     emit_resource "$region" "ses-configuration-set" "$set" "$arn" "$missing"
   done
 }
@@ -797,6 +1345,17 @@ start_scan_job() {
     TOTAL_SCANNED=0
     TOTAL_MISSING=0
     CSV_FILE=""
+    MISSING_RESOURCES_FILE=""
+    TAG_VALUES_APPS_FILE=""
+    TAG_VALUES_ENVS_FILE=""
+    if $INTERACTIVE_TAG; then
+      MISSING_RESOURCES_FILE="$RUN_TMP_DIR/${idx}.${label}.missing"
+      TAG_VALUES_APPS_FILE="$RUN_TMP_DIR/${idx}.${label}.apps"
+      TAG_VALUES_ENVS_FILE="$RUN_TMP_DIR/${idx}.${label}.envs"
+      : > "$MISSING_RESOURCES_FILE"
+      : > "$TAG_VALUES_APPS_FILE"
+      : > "$TAG_VALUES_ENVS_FILE"
+    fi
     [[ -n "$ORIGINAL_CSV_FILE" ]] && CSV_FILE="$csv"
     if [[ -n "$arg" ]]; then
       "$func" "$arg"
@@ -933,9 +1492,17 @@ log "Account: $ACCOUNT_ID"
 log "Region: $REGION"
 log "Required tags: $(join_by "," "${REQUIRED_TAGS[@]}")"
 log "Scanned resources: $TOTAL_SCANNED"
-log "Resources missing required tags: $TOTAL_MISSING"
+log "Resources missing or malformed required tags: $TOTAL_MISSING"
 if [[ -n "$CSV_FILE" ]]; then
   log "CSV written: $CSV_FILE"
+fi
+
+if $INTERACTIVE_TAG; then
+  if [[ -t 0 ]]; then
+    interactive_tag_resources
+  else
+    echo "Interactive tagging requires a TTY. Re-run with -t in a terminal." >&2
+  fi
 fi
 
 if [[ $TOTAL_MISSING -gt 0 ]]; then
