@@ -1,0 +1,17 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local / generated
+*.log
+.DS_Store
+
+# Secrets and personal data
+.env
+.env.*
+domains.csv
