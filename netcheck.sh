@@ -4,13 +4,14 @@
 
 LOG="${1:-netcheck.log}"
 GATEWAY=$(route -n get default 2>/dev/null | awk '/gateway/ {print $2}')
+INTERVAL=30
 
 if [ -z "$GATEWAY" ]; then
   echo "Could not detect default gateway" >&2
   exit 1
 fi
 
-echo "Logging to $LOG | gateway=$GATEWAY | external=8.8.8.8 | interval=10s"
+echo "Logging to $LOG | gateway=$GATEWAY | external=8.8.8.8 | interval=$INTERVAL sec"
 echo "Ctrl-C to stop."
 echo "---" | tee -a "$LOG"
 
@@ -25,5 +26,5 @@ while true; do
   LINE="[$TS] gw=$GW_RESULT  ext=$EXT_RESULT  dns=$DNS_RESULT"
   echo "$LINE" | tee -a "$LOG"
 
-  sleep 10
+  sleep $INTERVAL
 done
