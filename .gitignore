@@ -16,3 +16,11 @@ build/
 .env.*
 domains.csv
 ecsv_*.csv
+
+# Raw audit/billing exports and private notes: keep local, never commit
+# (the audit script's -c output and bill write-ups contain account IDs,
+# resource names and costs)
+aws_resource_tags_*.csv
+missing-tags*.csv
+aws_bill*.md
+private/

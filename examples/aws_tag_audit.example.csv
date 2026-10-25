@@ -1,0 +1,5 @@
+"account","region","service","name","resource_id","tags"
+"<account-id>","us-west-2","s3","example-assets-bucket","example-assets-bucket","M,M"
+"<account-id>","us-west-2","lambda","example-app-prod-worker","arn:aws:lambda:us-west-2:<account-id>:function:example-app-prod-worker","example-app,M"
+"<account-id>","us-west-2","rds-instance","example-app-dev","example-app-dev","M,dev"
+"<account-id>","global","route53","example.com.","Z0000000EXAMPLE","M,M"
