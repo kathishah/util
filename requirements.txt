@@ -1,3 +1,4 @@
+# Python 3.9+ (pandas 2.1 needs 3.9; markdown 3.5 needs 3.8)
 # Markdown to Word conversion dependencies
 python-docx>=1.1.0
 markdown>=3.5.0
