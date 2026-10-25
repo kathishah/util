@@ -22,7 +22,8 @@
 #   Phase 2 — Diff    : reads current tags per resource and compares to desired.
 #   Phase 3 — Apply   : uses resourcegroupstaggingapi tag-resources (merges
 #                        existing tags, works for any AWS service type).
-#                        -n skips apply and previews the changes instead.
+#                        Nothing is written unless --apply is given; the default
+#                        is a preview of the changes (same as -n).
 #
 # Adding a new AWS service type: copy any discover_X() function below, update
 # the AWS CLI call for that service, and call it in run_discovery(). Phase 3
@@ -30,11 +31,12 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Usage:
-#   ./scripts/tag_aws_resources.sh [flags] [app] [environment]
+#   ./tag_aws_resources.sh [flags] [app] [environment]
 #
 # Flags:
 #   -f, --find          auto-detect repo from current directory; find all apps
-#   -n, --dry-run       show what would be tagged; make no AWS changes
+#   -n, --dry-run       preview only: show what would be tagged (this is the default)
+#   --apply             actually write the tags (default is a dry run)
 #   -h, --help          show this help
 #   --prefix PREFIX     override the AWS resource name search prefix
 #                       (default: repo/directory name)
@@ -46,18 +48,18 @@
 #   environment  dev | staging | prod | all  (default: all)
 #
 # Examples:
-#   cd ~/dev/myapp  &&  ./scripts/tag_aws_resources.sh -f -n
-#   cd ~/dev/myrepo          &&  ./scripts/tag_aws_resources.sh -f -n
-#   cd ~/dev/myrepo          &&  ./scripts/tag_aws_resources.sh -f -n --prefix shortname
-#   ./scripts/tag_aws_resources.sh myapp prod -n
-#   ./scripts/tag_aws_resources.sh -h
+#   cd ~/dev/myapp  &&  ./tag_aws_resources.sh -f            # preview
+#   cd ~/dev/myrepo &&  ./tag_aws_resources.sh -f --apply    # write tags
+#   cd ~/dev/myrepo &&  ./tag_aws_resources.sh -f --prefix shortname
+#   ./tag_aws_resources.sh myapp prod --apply
+#   ./tag_aws_resources.sh -h
 
 set -euo pipefail
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 FIND=false
-DRY_RUN=false
+DRY_RUN=true    # safe default: preview only; --apply writes tags
 APP_FILTER=""
 ENV_FILTER="all"
 REGION="${AWS_REGION:-us-west-2}"
@@ -70,7 +72,8 @@ usage() {
   echo ""
   echo "Flags:"
   echo "  -f, --find          auto-detect repo from current directory; find all apps"
-  echo "  -n, --dry-run       show what would be tagged; make no AWS changes"
+  echo "  -n, --dry-run       preview only: show what would be tagged (this is the default)"
+  echo "  --apply             actually write the tags (default is a dry run)"
   echo "  -h, --help          show this help"
   echo "  --prefix PREFIX     override the AWS resource name search prefix"
   echo "                      (default: repo/directory name)"
@@ -82,10 +85,10 @@ usage() {
   echo "  environment  dev | staging | prod | all  (default: all)"
   echo ""
   echo "Examples:"
-  echo "  cd ~/dev/myapp  &&  $(basename "$0") -f -n"
-  echo "  cd ~/dev/myrepo          &&  $(basename "$0") -f -n"
-  echo "  cd ~/dev/myrepo          &&  $(basename "$0") -f -n --prefix shortname"
-  echo "  $(basename "$0") myapp prod -n"
+  echo "  cd ~/dev/myapp  &&  $(basename "$0") -f             # preview"
+  echo "  cd ~/dev/myrepo &&  $(basename "$0") -f --apply     # write tags"
+  echo "  cd ~/dev/myrepo &&  $(basename "$0") -f --prefix shortname"
+  echo "  $(basename "$0") myapp prod --apply"
   echo ""
   echo "Config file (.aws-tagger.yml in project root):"
   echo "  prefix: shortname        # search prefix when AWS names differ from repo name"
@@ -100,14 +103,15 @@ while [[ $i -lt ${#args[@]} ]]; do
   case "$arg" in
     -f|--find)    FIND=true ;;
     -n|--dry-run) DRY_RUN=true ;;
+    --apply)      DRY_RUN=false ;;
     -h|--help)    usage; exit 0 ;;
-    --prefix)     ((i++)); SEARCH_PREFIX="${args[$i]}" ;;
-    -j|--jobs)    ((i++)); PARALLEL_JOBS="${args[$i]}" ;;
+    --prefix)     i=$((i+1)); SEARCH_PREFIX="${args[$i]}" ;;
+    -j|--jobs)    i=$((i+1)); PARALLEL_JOBS="${args[$i]}" ;;
     dev|staging|prod|all) ENV_FILTER="$arg" ;;
     -*) echo "Unknown option: $arg  (use -h for help)"; exit 1 ;;
     *)  [[ -z "$APP_FILTER" ]] && APP_FILTER="$arg" ;;
   esac
-  ((i++))
+  i=$((i+1))
 done
 
 if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [[ "$PARALLEL_JOBS" -lt 1 ]]; then
@@ -238,7 +242,7 @@ derive_env() {
   if   [[ "$name" == *"-prod-"*    || "$name" == *"-prod"    ]]; then echo "prod"
   elif [[ "$name" == *"-staging-"* || "$name" == *"-staging" ]]; then echo "staging"
   elif [[ "$name" == *"-dev-"*     || "$name" == *"-dev"     ]]; then echo "dev"
-  else echo "prod"
+  else echo "prod"   # names with no -prod/-staging/-dev suffix are treated as prod
   fi
 }
 
@@ -924,9 +928,9 @@ run_apply() {
       echo    "         Application=${desired_app}  Environment=${desired_env}"
       echo -e "         ${DIM}(${desc})${NC}"
       echo ""
-      ((i++))
+      i=$((i+1))
     done
-    echo -e "  ${CYAN}Dry run: ${n} change(s) pending. Re-run without -n to apply.${NC}"
+    echo -e "  ${CYAN}Dry run: ${n} change(s) pending. Nothing was written. Re-run with --apply to write these tags.${NC}"
     return
   fi
 
@@ -999,7 +1003,7 @@ run_apply() {
       echo -e "${RED}✗ failed${NC}  ${DIM}(${result})${NC}"
       ERRORS=$((ERRORS + 1))
     fi
-    ((i++))
+    i=$((i+1))
   done
 
   echo ""
@@ -1197,7 +1201,7 @@ fi
 # Final fallback: use repo name when nothing was detected or explicitly set
 [[ -z "$SEARCH_PREFIX" ]] && SEARCH_PREFIX="$REPO"
 
-DRY_NOTE=""; $DRY_RUN && DRY_NOTE=" ${CYAN}[DRY RUN]${NC}"
+DRY_NOTE=""; $DRY_RUN && DRY_NOTE=" ${CYAN}[DRY RUN - use --apply to write tags]${NC}"
 
 echo -e "${BOLD}==========================================${NC}"
 echo -e "  AWS Resource Tagging${DRY_NOTE}"
