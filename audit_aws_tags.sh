@@ -462,9 +462,22 @@ apply_route53_tags() {
 
 apply_s3_tags() {
   local bucket="$1" missing="$2" app="$3" env="$4"
-  local raw key value items=()
+  local raw key value items=() err_file
 
-  raw=$(aws_query_rows "TagSet[].[Key,Value]" s3api get-bucket-tagging --bucket "$bucket" 2>/dev/null) || raw=""
+  # put-bucket-tagging REPLACES the whole tag set, so the existing tags must be
+  # read reliably. Only "no tag set yet" (NoSuchTagSet) may be treated as empty;
+  # any other failure (throttling, AccessDenied, ...) aborts without writing.
+  err_file=$(mktemp)
+  if raw=$(aws s3api get-bucket-tagging --bucket "$bucket" --query "TagSet[].[Key,Value]" --output text 2>"$err_file"); then
+    raw="${raw//$'\r'/}"
+  elif grep -q 'NoSuchTagSet' "$err_file"; then
+    raw=""
+  else
+    echo "Cannot read existing tags for s3 bucket ${bucket}; not writing (would replace them): $(head -c 200 "$err_file" | tr '\n' ' ')" >&2
+    rm -f "$err_file"
+    return 1
+  fi
+  rm -f "$err_file"
   while IFS=$'\t' read -r key value; do
     [[ -z "$key" || "$key" == "None" ]] && continue
     [[ "$key" == "Application" && -n "$app" ]] && continue
@@ -778,7 +791,7 @@ interactive_tag_resources() {
     echo "  Environments: ${envs_list}" >&2
 
     while true; do
-      read -r -p "app,env (s=skip q=quit): " reply
+      read -r -p "app,env (s=skip q=quit): " reply || break 2   # EOF/closed stdin ends the session
       reply=$(clean_value "$reply")
       reply_l=$(reply_lower "$reply")
       case "$reply_l" in

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Pings local gateway and 8.8.8.8 every 10s; logs results with timestamps.
-# Usage: ./netcheck.sh [logfile]
+# Pings local gateway and 8.8.8.8 and resolves a DNS name every 30s (override with
+# NETCHECK_INTERVAL=seconds); logs results with timestamps.
+# Usage: [NETCHECK_INTERVAL=10] ./netcheck.sh [logfile]
 
 LOG="${1:-netcheck.log}"
 GATEWAY=$(route -n get default 2>/dev/null | awk '/gateway/ {print $2}')
-INTERVAL=30
+INTERVAL="${NETCHECK_INTERVAL:-30}"
+case "$INTERVAL" in ''|*[!0-9]*) echo "NETCHECK_INTERVAL must be a whole number of seconds" >&2; exit 1 ;; esac
 
 if [ -z "$GATEWAY" ]; then
   echo "Could not detect default gateway" >&2

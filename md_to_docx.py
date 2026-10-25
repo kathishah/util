@@ -7,7 +7,7 @@ If multiple markdown files are provided, they will be collated into a single doc
 import sys
 from pathlib import Path
 from docx import Document
-from docx.shared import Pt, Inches
+from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 import markdown
 from bs4 import BeautifulSoup
@@ -78,8 +78,13 @@ def parse_inline_elements(element, paragraph):
             run.font.name = 'Courier New'
             run.font.size = Pt(10)
         elif content.name == 'a':
-            run = paragraph.add_run(content.get_text())
-            run.font.color.rgb = None  # Blue underlined text
+            text = content.get_text()
+            run = paragraph.add_run(text)
+            run.font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
+            run.font.underline = True
+            href = content.get('href')
+            if href and href != text:
+                paragraph.add_run(f" ({href})")  # keep the URL; not a live hyperlink
         else:
             paragraph.add_run(content.get_text())
 

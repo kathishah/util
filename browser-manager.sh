@@ -172,10 +172,11 @@ echo ""
 # ── 3. Set new default by name ────────────────────────────────
 echo -e "${YELLOW}${BOLD}▸ Set Default Browser${NC}"
 echo -n "  Type browser name (or 'q' to quit): "
-read -r choice
+read -r choice || choice=""
 echo ""
 
-if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
+# Empty input (or EOF) must not fuzzy-match the first browser.
+if [[ -z "$choice" || "$choice" == "q" || "$choice" == "Q" ]]; then
     echo -e "  ${BLUE}Exiting. No changes made.${NC}"
     exit 0
 fi

@@ -7,6 +7,7 @@ If multiple CSV files are provided, each will be added as a separate sheet.
 import sys
 from pathlib import Path
 import pandas as pd
+from openpyxl.utils import get_column_letter
 
 
 def csv_to_xlsx(input_files, output_file):
@@ -60,7 +61,7 @@ def csv_to_xlsx(input_files, output_file):
                     len(str(col))
                 )
                 # Set column width (add some padding)
-                worksheet.column_dimensions[chr(65 + i)].width = min(max_len + 2, 50)
+                worksheet.column_dimensions[get_column_letter(i + 1)].width = min(max_len + 2, 50)
     
     print(f"\nExcel file saved to: {output_file}")
 
